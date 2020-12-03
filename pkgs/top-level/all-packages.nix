@@ -1079,6 +1079,10 @@ in
 
   go-check = callPackage ../development/tools/check { };
 
+  volta = callPackage ../development/tools/volta {
+    inherit (darwin.apple_sdk.frameworks) Security;
+  };
+
   chkcrontab = callPackage ../tools/admin/chkcrontab { };
 
   claws = callPackage ../tools/misc/claws { };
