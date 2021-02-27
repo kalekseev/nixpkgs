@@ -9,7 +9,7 @@ let
 
 common =
   { lib, stdenv, fetchpatch, perl, curl, bzip2, sqlite, openssl ? null, xz
-  , bash, coreutils, gzip, gnutar
+  , bash, coreutils, utillinux, gzip, gnutar
   , pkgconfig, boehmgc, perlPackages, libsodium, brotli, boost, editline, nlohmann_json
   , autoreconfHook, autoconf-archive, bison, flex
   , jq, libarchive
@@ -40,7 +40,7 @@ common =
       outputs = [ "out" "dev" "man" "doc" ];
 
       nativeBuildInputs =
-        [ pkgconfig ]
+        [ pkgconfig utillinux ]
         ++ lib.optionals is30
           [ autoreconfHook
             autoconf-archive
