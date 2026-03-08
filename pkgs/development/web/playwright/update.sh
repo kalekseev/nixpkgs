@@ -3,26 +3,65 @@
 set -euo pipefail
 
 root="$(dirname "$(readlink -f "$0")")"
+repo_root="$(git -C "$root" rev-parse --show-toplevel)"
+cd "$repo_root"
 
 version=$(curl ${GITHUB_TOKEN:+" -u \":$GITHUB_TOKEN\""} -s https://api.github.com/repos/microsoft/playwright-python/releases/latest | jq -r '.tag_name | sub("^v"; "")')
 # Most of the time, this should be the latest stable release of the Node-based
 # Playwright version, but that isn't a guarantee, so this needs to be specified
 # as well:
 setup_py_url="https://github.com/microsoft/playwright-python/raw/v${version}/setup.py"
-driver_version=$(curl -Ls "$setup_py_url" | grep '^driver_version =' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+')
+driver_version_setup_py=$(curl -Ls "$setup_py_url" | grep '^driver_version =' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+')
+python_major_minor=$(echo "$version" | sed -E 's/^([0-9]+\.[0-9]+)\..*$/\1/')
+resolve_driver_version_latest_patch() {
+    local mm_escaped
+    mm_escaped=$(echo "$python_major_minor" | sed 's/\./\\./g')
+    curl -fsSL "https://registry.npmjs.org/playwright" \
+        | jq -r '.versions | keys[]' \
+        | grep -E "^${mm_escaped}\.[0-9]+$" \
+        | sort -V \
+        | tail -n1
+}
+driver_version="$(resolve_driver_version_latest_patch || true)"
+if [ -z "${driver_version}" ]; then
+    driver_version="$driver_version_setup_py"
+fi
 
 # TODO: skip if update-source-version reported the same version
 update-source-version playwright-driver "$driver_version"
 update-source-version python3Packages.playwright "$version"
 
 driver_file="$root/driver.nix"
-repo_url_prefix="https://github.com/microsoft/playwright/raw"
+repo_url_prefix="https://raw.githubusercontent.com/microsoft/playwright"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 
 # Update playwright-mcp package
-mcp_version=$(curl ${GITHUB_TOKEN:+" -u \":$GITHUB_TOKEN\""} -s https://api.github.com/repos/microsoft/playwright-mcp/releases/latest | jq -r '.tag_name | sub("^v"; "")')
+driver_major_minor=$(echo "$driver_version" | sed -E 's/^([0-9]+\.[0-9]+)\..*$/\1/')
+resolve_mcp_version() {
+    local releases_json
+    releases_json=$(curl ${GITHUB_TOKEN:+" -u \":$GITHUB_TOKEN\""} -s "https://api.github.com/repos/microsoft/playwright-mcp/releases?per_page=100")
+    while IFS= read -r tag_name; do
+        local mcp_version_candidate mcp_npm_url mcp_playwright_dep mcp_major_minor
+        mcp_version_candidate=$(echo "$tag_name" | sed 's/^v//')
+        mcp_npm_url="https://registry.npmjs.org/@playwright/mcp/${mcp_version_candidate}"
+        mcp_playwright_dep=$(
+            curl -fsSL "$mcp_npm_url" \
+                | jq -r '.dependencies.playwright // .dependencies["playwright-core"] // empty'
+        ) || continue
+        mcp_major_minor=$(echo "$mcp_playwright_dep" | grep -Eo '[0-9]+\.[0-9]+' | head -n1 || true)
+        if [ "$mcp_major_minor" = "$driver_major_minor" ]; then
+            echo "$mcp_version_candidate"
+            return 0
+        fi
+    done < <(echo "$releases_json" | jq -r '.[].tag_name')
+    return 1
+}
+mcp_version="$(resolve_mcp_version)" || {
+    echo "Could not find a playwright-mcp release compatible with Playwright driver ${driver_version}" >&2
+    exit 1
+}
 update-source-version playwright-mcp "$mcp_version"
 
 # Update npmDepsHash for playwright-mcp
@@ -45,6 +84,43 @@ prefetch_browser() {
   # nix-prefetch is used to obtain sha with `stripRoot = false`
   # doesn't work on macOS https://github.com/msteen/nix-prefetch/issues/53
   nix-prefetch --option extra-experimental-features flakes -q "{ stdenv, fetchzip }: stdenv.mkDerivation { name=\"browser\"; src = fetchzip { url = \"$1\"; stripRoot = $2; }; }"
+}
+
+browser_download_url() {
+    local name="$1"
+    local buildname="$2"
+    local platform="$3"
+    local arch="$4"
+    local revision="$5"
+    local browser_version="$6"
+    local suffix="$7"
+
+    # Chromium and chromium-headless-shell use Chrome for Testing artifacts on
+    # Linux/macOS on x86_64 and aarch64-darwin.
+    if [ "$name" = "chromium" ] || [ "$name" = "chromium-headless-shell" ]; then
+        if [ "$name" = "chromium" ]; then
+            artifact="chrome"
+        else
+            artifact="chrome-headless-shell"
+        fi
+
+        if [ "$platform" = "linux" ] && [ "$arch" = "x86_64" ]; then
+            echo "https://cdn.playwright.dev/chrome-for-testing-public/${browser_version}/linux64/${artifact}-linux64.zip"
+            return
+        fi
+
+        if [ "$platform" = "darwin" ]; then
+            if [ "$arch" = "x86_64" ]; then
+                cft_platform="mac-x64"
+            else
+                cft_platform="mac-arm64"
+            fi
+            echo "https://cdn.playwright.dev/chrome-for-testing-public/${browser_version}/${cft_platform}/${artifact}-${cft_platform}.zip"
+            return
+        fi
+    fi
+
+    echo "https://cdn.playwright.dev/dbazure/download/playwright/builds/${buildname}/${revision}/${name}-${suffix}.zip"
 }
 
 update_browser() {
@@ -78,10 +154,13 @@ update_browser() {
     fi
 
     revision="$(jq -r ".browsers[\"$buildname\"].revision" "$root/browsers.json")"
+    browser_version="$(jq -r ".browsers[\"$buildname\"].browserVersion // empty" "$root/browsers.json")"
+    x86_64_url="$(browser_download_url "$name" "$buildname" "$platform" "x86_64" "$revision" "$browser_version" "$suffix")"
+    aarch64_url="$(browser_download_url "$name" "$buildname" "$platform" "aarch64" "$revision" "$browser_version" "$aarch64_suffix")"
     replace_sha "$root/$name.nix" "x86_64-$platform" \
-        "$(prefetch_browser "https://playwright.azureedge.net/builds/$buildname/$revision/$name-$suffix.zip" $stripRoot)"
+        "$(prefetch_browser "$x86_64_url" "$stripRoot")"
     replace_sha "$root/$name.nix" "aarch64-$platform" \
-        "$(prefetch_browser "https://playwright.azureedge.net/builds/$buildname/$revision/$name-$aarch64_suffix.zip" $stripRoot)"
+        "$(prefetch_browser "$aarch64_url" "$stripRoot")"
 }
 
 curl -fsSl \
