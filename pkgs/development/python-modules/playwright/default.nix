@@ -109,6 +109,7 @@ buildPythonPackage rec {
     maintainers = with lib.maintainers; [
       techknowlogick
       yrd
+      kalekseev
     ];
     platforms = [
       "x86_64-linux"
